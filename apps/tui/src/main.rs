@@ -22,12 +22,14 @@ const COLOR_TEXT: Color = Color::White;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Tab {
     Home,
+    Task,
     Settings,
 }
 
 #[derive(Debug, Clone)]
 struct UiRegions {
     home_tab: Rect,
+    task_tab: Rect,
     settings_tab: Rect,
     start_button: Option<Rect>,
     setting_rows: Vec<Rect>,
@@ -37,6 +39,7 @@ impl Default for UiRegions {
     fn default() -> Self {
         Self {
             home_tab: Rect::default(),
+            task_tab: Rect::default(),
             settings_tab: Rect::default(),
             start_button: None,
             setting_rows: Vec::new(),
@@ -62,7 +65,6 @@ impl App {
             settings_items: vec![
                 "查看服务商",
                 "添加服务商",
-                "添加服务商",
                 "删除服务商",
                 "反馈问题",
                 "配置",
@@ -74,8 +76,17 @@ impl App {
 
     fn next_tab(&mut self) {
         self.active_tab = match self.active_tab {
-            Tab::Home => Tab::Settings,
+            Tab::Home => Tab::Task,
+            Tab::Task => Tab::Settings,
             Tab::Settings => Tab::Home,
+        };
+    }
+
+    fn prev_tab(&mut self) {
+        self.active_tab = match self.active_tab {
+            Tab::Home => Tab::Settings,
+            Tab::Task => Tab::Home,
+            Tab::Settings => Tab::Task,
         };
     }
 
@@ -102,6 +113,9 @@ impl App {
             Tab::Home => {
                 self.status = "已触发：开始任务（示例动作）".to_string();
             }
+            Tab::Task => {
+                self.status = "任务页：待接入任务列表与执行进度".to_string();
+            }
             Tab::Settings => {
                 let item = self.settings_items[self.selected_setting];
                 self.status = format!("设置动作：{item}");
@@ -112,8 +126,8 @@ impl App {
     fn on_key(&mut self, code: KeyCode) {
         match code {
             KeyCode::Char('q') | KeyCode::Esc => self.running = false,
-            KeyCode::Left => self.active_tab = Tab::Home,
-            KeyCode::Right => self.active_tab = Tab::Settings,
+            KeyCode::Left => self.prev_tab(),
+            KeyCode::Right => self.next_tab(),
             KeyCode::Tab => self.next_tab(),
             KeyCode::Up => {
                 if self.active_tab == Tab::Settings {
@@ -135,6 +149,10 @@ impl App {
             self.active_tab = Tab::Home;
             return;
         }
+        if in_rect(self.ui_regions.task_tab, x, y) {
+            self.active_tab = Tab::Task;
+            return;
+        }
         if in_rect(self.ui_regions.settings_tab, x, y) {
             self.active_tab = Tab::Settings;
             return;
@@ -149,6 +167,7 @@ impl App {
                     }
                 }
             }
+            Tab::Task => {}
             Tab::Settings => {
                 for (idx, rect) in self.ui_regions.setting_rows.iter().enumerate() {
                     if in_rect(*rect, x, y) {
@@ -239,7 +258,14 @@ fn draw_ui(f: &mut Frame<'_>, app: &App) -> UiRegions {
     let y = tab_row.y;
     let h = btn_h.min(tab_row.height);
     let home_tab = Rect::new(tab_row.x, y, btn_w.min(tab_row.width), h);
-    let settings_x = tab_row.x.saturating_add(btn_w).saturating_add(gap);
+    let task_x = tab_row.x.saturating_add(btn_w).saturating_add(gap);
+    let task_w = if task_x < tab_row.x.saturating_add(tab_row.width) {
+        btn_w.min(tab_row.x + tab_row.width - task_x)
+    } else {
+        0
+    };
+    let task_tab = Rect::new(task_x, y, task_w, h);
+    let settings_x = task_x.saturating_add(btn_w).saturating_add(gap);
     let settings_w = if settings_x < tab_row.x.saturating_add(tab_row.width) {
         btn_w.min(tab_row.x + tab_row.width - settings_x)
     } else {
@@ -248,10 +274,12 @@ fn draw_ui(f: &mut Frame<'_>, app: &App) -> UiRegions {
     let settings_tab = Rect::new(settings_x, y, settings_w, h);
 
     render_menu_button(f, home_tab, "首页", app.active_tab == Tab::Home);
+    render_menu_button(f, task_tab, "任务", app.active_tab == Tab::Task);
     render_menu_button(f, settings_tab, "设置", app.active_tab == Tab::Settings);
 
     let mut regions = UiRegions {
         home_tab,
+        task_tab,
         settings_tab,
         start_button: None,
         setting_rows: Vec::new(),
@@ -260,6 +288,9 @@ fn draw_ui(f: &mut Frame<'_>, app: &App) -> UiRegions {
     match app.active_tab {
         Tab::Home => {
             regions.start_button = render_home(f, chunks[1]);
+        }
+        Tab::Task => {
+            render_task(f, chunks[1]);
         }
         Tab::Settings => {
             regions.setting_rows = render_settings(f, chunks[1], app);
@@ -406,6 +437,24 @@ fn render_settings(f: &mut Frame<'_>, area: Rect, app: &App) -> Vec<Rect> {
         ));
     }
     rows
+}
+
+fn render_task(f: &mut Frame<'_>, area: Rect) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" 任务 ")
+        .border_style(Style::default().fg(COLOR_ACCENT));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let content = Paragraph::new(vec![
+        Line::from("任务中心"),
+        Line::from("后续接入：任务队列、执行进度、失败重试、日志追踪。"),
+    ])
+    .style(Style::default().fg(COLOR_TEXT).bg(COLOR_BG))
+    .alignment(Alignment::Left);
+
+    f.render_widget(content, inner);
 }
 
 fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {

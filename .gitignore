@@ -1,22 +1,68 @@
-weights/icon_caption_blip2
-weights/icon_caption_florence
-weights/icon_detect/
-weights/icon_detect_v1_5/
-weights/icon_detect_v1_5_2/
-.gradio
+# -----------------------------
+# OS / Editor
+# -----------------------------
+.DS_Store
+Thumbs.db
+Desktop.ini
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# -----------------------------
+# Secrets / local env
+# -----------------------------
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+
+# -----------------------------
+# Rust
+# -----------------------------
+target/
+
+# -----------------------------
+# Python
+# -----------------------------
 __pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+env/
+.python-version
+
+# -----------------------------
+# Jupyter / debug artifacts
+# -----------------------------
+.ipynb_checkpoints/
 debug.ipynb
-util/__pycache__/
-index.html?linkid=2289031
-wget-log
-weights/icon_caption_florence_v2/
+
+# -----------------------------
+# Runtime data / logs
+# -----------------------------
+logs/*.log
+data/*.db
+data/*.sqlite
+data/*.sqlite3
+data/*.db-*
+
+# -----------------------------
+# OmniParser heavy artifacts
+# -----------------------------
+python/OmniParser-master/weights/
+python/OmniParser-master/outputs/
 omnitool/gradio/uploads/
-test/
-python/OmniParser-master/weights
-python/OmniParser-master/weights/icon_caption_blip2
-python/OmniParser-master/weights/icon_caption_florence
-python/OmniParser-master/weights/icon_detect/
-python/OmniParser-master/weights/icon_detect_v1_5/
-python/OmniParser-master/weights/icon_detect_v1_5_2/
-python/OmniParser-master/outputs
-data/job_agent.db
+.gradio/
+
+# -----------------------------
+# Misc temporary files
+# -----------------------------
+wget-log
+index.html?linkid=2289031
