@@ -1,0 +1,20 @@
+﻿[workspace]
+members = [
+  "apps/daemon",
+  "apps/tui",
+  "crates/storage"
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "AGPL-3.0"
+version = "0.1.0"
+
+[workspace.dependencies]
+anyhow = "1.0"
+crossterm = "0.28"
+ratatui = "0.29"
+sqlx = { version = "0.8", features = ["sqlite", "runtime-tokio-rustls"] }
+thiserror = "2.0"
+tokio = { version = "1.44", features = ["macros", "rt-multi-thread", "fs"] }

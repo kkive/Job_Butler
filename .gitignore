@@ -12,3 +12,11 @@ wget-log
 weights/icon_caption_florence_v2/
 omnitool/gradio/uploads/
 test/
+python/OmniParser-master/weights
+python/OmniParser-master/weights/icon_caption_blip2
+python/OmniParser-master/weights/icon_caption_florence
+python/OmniParser-master/weights/icon_detect/
+python/OmniParser-master/weights/icon_detect_v1_5/
+python/OmniParser-master/weights/icon_detect_v1_5_2/
+python/OmniParser-master/outputs
+data/job_agent.db

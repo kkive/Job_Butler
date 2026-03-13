@@ -1,287 +1,304 @@
-## 项目名称
-**Job-Agent**
+# AGENTS.md
 
-基于 AI Agent 的自动求职系统。
+This file defines how AI agents should operate within this repository.
 
-该系统通过 **大语言模型决策 + 计算机自动化操作** 的方式，自动识别招聘网站界面并完成简历投递。
-系统主要使用 **Rust 实现核心框架**，并在必要时使用 **Python 作为 AI 规划与视觉辅助模块**。
+Agents must follow these rules when reading, modifying, or generating
+code.
 
----
+The purpose of this project is to build an AI-powered autonomous job
+application system.
 
-# 一、项目概述
+The system automatically interacts with job websites using: - LLM
+decision making - UI recognition - automated mouse interaction
 
-Job-Agent 是一个自动化求职工具，目标是帮助用户自动完成招聘网站的投递流程。
+Agents must respect the architecture and constraints described in this
+document.
 
-系统主要能力包括：
+------------------------------------------------------------------------
 
-- 自动识别招聘网站界面
-- 分析屏幕内容
-- 定位可交互按钮
-- 自动控制鼠标与键盘
-- 通过 LLM 决策下一步操作
-- 自动投递简历
-- 记录投递进度与日志
+# 1. 项目定位
 
-系统采用 **Agent 架构设计**：
+项目名称
 
-用户界面
-   ↓
-任务编排模块
-   ↓
-AI 决策模块
-   ↓
-工具执行模块
-   ↓
-招聘平台逻辑
-   ↓
-数据存储
+Job-Agent
 
----
+这是一个基于 AI Agent
+的自动求职系统，核心目标是自动完成招聘网站投递流程。
 
-# 二、技术栈
+系统核心流程
 
-## 核心语言
+1 捕获屏幕 2 识别 UI 元素 3 使用 LLM 决策下一步动作 4 自动执行鼠标操作 5
+记录投递结果
+
+系统架构
+
+User ↓ Orchestrator ↓ Vision Parsing ↓ LLM Decision ↓ Tool Execution ↓
+Storage
+
+------------------------------------------------------------------------
+
+# 2. 技术栈
+
+主要语言
+
 Rust
 
-## 辅助语言
+辅助语言
+
 Python
 
-## 主要库
+Rust 库
 
-### Rust
-- ratatui
-- tokio
-- serde
-- reqwest
-- sqlx
+-   tokio
+-   ratatui
+-   serde
+-   reqwest
+-   sqlx
 
-### Python
-- LangChain 或自定义 Planner
-- YOLO
-- OCR
+Python 组件
 
-数据库：SQLite
+-   AutoGen
+-   OmniParser
+-   OCR
 
----
+数据库
 
-# 三、项目目录结构
+SQLite
+
+------------------------------------------------------------------------
+
+# 3. Repository Structure
 
 job-agent/
-│
-├─ apps/
-│  ├─ tui/
-│  └─ daemon/
-│
-├─ crates/
-│  ├─ common/
-│  ├─ core/
-│  ├─ config/
-│  ├─ storage/
-│  ├─ api/
-│  ├─ ai/
-│  ├─ tools/
-│  ├─ orchestrator/
-│  ├─ recruiter/
-│  └─ resume/
-│
-├─ python/
-│  ├─ planner/
-│  ├─ vision/
-│  └─ bridge/
-│
-├─ prompts/
-├─ configs/
-├─ migrations/
-├─ data/
-├─ logs/
-└─ docs/
 
----
+apps/ - tui - daemon
 
-# 四、模块职责
+crates/ - common - core - config - storage - api - ai - tools -
+orchestrator - recruiter - resume
 
-## apps/tui
-终端 UI 界面，负责：
-- 首页展示
-- 任务进度
-- 服务商管理
-- 系统配置
-- 启动任务
+python/ - planner - vision - bridge
 
-## orchestrator
-任务编排模块，负责：
-- 任务调度
-- 执行流程
-- 状态管理
-- 失败重试
+prompts/ configs/ migrations/ data/ logs/ docs/
 
-## ai
-AI 决策模块，负责：
-- 构建 LLM 上下文
-- 管理提示词
-- 调用模型
-- 输出结构化动作
+Agents must not change this structure unless absolutely necessary.
 
-示例输出：
+------------------------------------------------------------------------
 
-{
-  "action": "click",
-  "target": "立即沟通",
-  "confidence": 0.92
-}
+# 4. 核心模块说明
 
-## tools
-自动化工具模块：
-- 截图
-- OCR
-- UI识别
-- 鼠标控制
-- 键盘控制
-- 窗口控制
+Orchestrator
 
-## recruiter
-招聘网站适配模块：
-- Boss直聘
-- 智联招聘
-- 猎聘
+位置
 
-负责页面解析与投递逻辑。
+crates/orchestrator
 
-## resume
-简历管理模块：
-- 多版本简历
-- 附件管理
-- 模板选择
-- 求职信生成
+职责
 
-## storage
-数据持久化模块：
-- SQLite数据库
-- 投递记录
-- 日志存储
+-   任务调度
+-   状态机执行
+-   重试机制
+-   超时控制
+-   协调 AI 与工具模块
 
-## api
-外部服务接口模块：
-- LLM API
-- OCR API
-- 视觉模型
-- 通知服务
+这是整个系统唯一的工作流入口。
 
----
+------------------------------------------------------------------------
 
-# 五、核心数据表
+AI Decision Layer
 
-user
-id
-first_use_time
+位置
 
-prompt
-id
-content
-created_at
+crates/ai
 
-service
-provider_name
-model_name
-api_url
-api_key
+职责
 
-task
-id
-type
-status
-retry_count
-created_at
+-   构建提示词
+-   调用 LLM
+-   生成结构化动作
 
-job
-id
-platform
-company
-title
-url
-salary
-location
+示例输出
 
-application
-id
-job_id
-resume_id
-status
-apply_time
+{ "action":"click", "target":"立即沟通", "confidence":0.92,
+"reason":"button visible" }
 
-denylist
-company
-blocked_time
+AI 输出必须始终为 JSON。
 
----
+------------------------------------------------------------------------
 
-# 六、Agent 执行流程
+Vision System
 
-用户点击开始
-↓
-创建任务
-↓
-任务编排模块启动
-↓
-截图
-↓
-视觉识别
-↓
-AI 判断下一步
-↓
-执行工具操作
-↓
-更新数据库
-↓
-循环直到流程结束
+位置
 
----
+python/vision
 
-# 七、开发规则
+职责
 
-1. 工具模块不允许包含业务逻辑
-2. AI 输出必须为 JSON
-3. 外部 API 必须通过 api 模块调用
-4. orchestrator 是唯一调度入口
-5. 数据库访问必须通过 storage
-6. 所有错误必须统一处理
+-   UI 元素检测
+-   屏幕结构解析
+-   坐标提取
+-   OCR 兜底识别
 
----
+该模块禁止包含业务逻辑。
 
-# 八、日志
+------------------------------------------------------------------------
 
-日志目录：
+Planner
+
+位置
+
+python/planner
+
+使用 AutoGen 实现
+
+-   多 Agent 推理
+-   任务拆分
+-   动作建议
+
+------------------------------------------------------------------------
+
+Tools Layer
+
+位置
+
+crates/tools
+
+职责
+
+-   截图
+-   鼠标移动
+-   鼠标点击
+-   键盘输入
+-   窗口控制
+
+Tools 只负责执行动作，不允许包含决策逻辑。
+
+------------------------------------------------------------------------
+
+Storage
+
+位置
+
+crates/storage
+
+职责
+
+-   数据库访问
+-   投递记录
+-   日志
+
+SQLite 访问必须通过该模块。
+
+------------------------------------------------------------------------
+
+# 5. 执行流程
+
+Start Task 
+↓ 
+Screenshot
+ ↓ 
+Vision Parse
+  ↓ 
+Planner Analyze 
+  ↓ 
+LLM Decide 
+  ↓
+JSON Action
+ ↓
+Tool Execute 
+ ↓ 
+Store Result 
+ ↓
+Repeat
+
+------------------------------------------------------------------------
+
+# 6. Coding Rules
+
+1 Orchestrator 控制全部工作流\
+2 Tools 不允许包含业务逻辑\
+3 AI 输出必须为 JSON\
+4 外部 API 统一通过 crates/api 调用\
+5 数据库访问必须通过 crates/storage\
+6 Vision 模块禁止决策逻辑\
+7 鼠标点击必须验证坐标有效性\
+8 所有错误必须记录日志
+
+------------------------------------------------------------------------
+
+# 7. 代码规范（新增）
+
+1 所有代码注释必须使用 **中文**\
+2 注释必须清晰说明模块作用与逻辑\
+3 关键算法必须写完整中文注释\
+4 对复杂流程必须写步骤说明
+
+------------------------------------------------------------------------
+
+# 8. 用户与语言规则（新增）
+
+本项目优先面向 **中国开发者和中国用户**。
+
+因此所有 Agent 在生成内容时必须遵循以下规则：
+
+1 优先使用 **中文** 进行说明\
+2 所有提示词默认使用中文\
+3 所有文档优先保证中国开发者可以理解\
+4 如需使用英文必须附带中文解释
+
+------------------------------------------------------------------------
+
+# 9. Logging
+
+日志目录
 
 logs/
 
-日志类型：
+日志文件
 
-app.log
-error.log
-task.log
+app.log\
+error.log\
+task.log\
+action.log
 
----
+------------------------------------------------------------------------
 
-# 九、安全
+# 10. Security
 
-- API Key 必须加密存储
-- 日志禁止输出敏感信息
-- 使用 .env 管理密钥
+安全规则
 
----
+-   API Key 不允许写入日志
+-   密钥必须存储在 .env
+-   凭证通过环境变量读取
+-   自动操作必须提供紧急停止机制
 
-# 十、未来规划
+------------------------------------------------------------------------
 
-- 浏览器自动化
-- AI岗位匹配
-- 简历优化
-- 面试提醒
-- 多平台求职
+# 11. Agent Behavior
 
----
+Agent 在本仓库运行必须遵守
 
-# 十一、许可证
+1 修改代码前必须阅读 AGENTS.md\
+2 必须保持模块边界\
+3 禁止修改无关模块\
+4 代码修改必须可预测\
+5 架构修改必须说明原因
 
-推荐使用：
+------------------------------------------------------------------------
+
+# 12. Roadmap
+
+未来功能
+
+-   浏览器自动化
+-   AI 岗位匹配
+-   简历优化
+-   面试提醒
+-   多平台并行投递
+
+------------------------------------------------------------------------
+
+# 13. License
+
+推荐许可证
 
 AGPL-3.0
