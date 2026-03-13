@@ -2,7 +2,7 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
-use sqlx::{Pool, Sqlite};
+use sqlx::{Pool, Row, Sqlite};
 
 use crate::error::StorageError;
 
@@ -14,6 +14,23 @@ pub struct DatabaseInitReport {
     pub created_or_rebuilt: bool,
     pub recovered_from_corruption: bool,
     pub backup_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ServiceProvider {
+    pub id: i64,
+    pub provider_name: String,
+    pub model_name: String,
+    pub api_url: String,
+    pub api_key: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct NewServiceProvider {
+    pub provider_name: String,
+    pub model_name: String,
+    pub api_url: String,
+    pub api_key: String,
 }
 
 pub async fn init_or_recover_database<P: AsRef<Path>>(
@@ -66,6 +83,81 @@ pub async fn reset_database<P: AsRef<Path>>(db_path: P) -> Result<PathBuf, Stora
     }
 
     Ok(report.db_path)
+}
+
+pub async fn list_service_providers<P: AsRef<Path>>(
+    db_path: P,
+) -> Result<Vec<ServiceProvider>, StorageError> {
+    let db_path = db_path.as_ref().to_path_buf();
+    let pool = open_pool(&db_path, true).await?;
+    apply_pragmas(&pool).await?;
+    apply_schema(&pool).await?;
+
+    let rows = sqlx::query(
+        "SELECT id, provider_name, model_name, api_url, api_key
+         FROM service
+         ORDER BY id ASC;",
+    )
+    .fetch_all(&pool)
+    .await?;
+
+    let services = rows
+        .into_iter()
+        .map(|row| ServiceProvider {
+            id: row.get::<i64, _>("id"),
+            provider_name: row.get::<String, _>("provider_name"),
+            model_name: row.get::<String, _>("model_name"),
+            api_url: row.get::<String, _>("api_url"),
+            api_key: row.get::<String, _>("api_key"),
+        })
+        .collect::<Vec<_>>();
+
+    pool.close().await;
+    Ok(services)
+}
+
+pub async fn add_service_provider<P: AsRef<Path>>(
+    db_path: P,
+    input: NewServiceProvider,
+) -> Result<i64, StorageError> {
+    let db_path = db_path.as_ref().to_path_buf();
+    let pool = open_pool(&db_path, true).await?;
+    apply_pragmas(&pool).await?;
+    apply_schema(&pool).await?;
+
+    let result = sqlx::query(
+        "INSERT INTO service (provider_name, model_name, api_url, api_key)
+         VALUES (?, ?, ?, ?);",
+    )
+    .bind(input.provider_name)
+    .bind(input.model_name)
+    .bind(input.api_url)
+    .bind(input.api_key)
+    .execute(&pool)
+    .await?;
+
+    let id = result.last_insert_rowid();
+    pool.close().await;
+    Ok(id)
+}
+
+pub async fn delete_service_provider<P: AsRef<Path>>(
+    db_path: P,
+    id: i64,
+) -> Result<bool, StorageError> {
+    let db_path = db_path.as_ref().to_path_buf();
+    let pool = open_pool(&db_path, true).await?;
+    apply_pragmas(&pool).await?;
+    apply_schema(&pool).await?;
+
+    let result = sqlx::query("DELETE FROM service WHERE id = ?;")
+        .bind(id)
+        .execute(&pool)
+        .await?;
+
+    let deleted = result.rows_affected() > 0;
+    pool.close().await;
+    Ok(deleted)
 }
 
 async fn is_database_healthy(db_path: &Path) -> Result<bool, StorageError> {

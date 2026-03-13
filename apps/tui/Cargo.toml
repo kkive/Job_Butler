@@ -8,3 +8,6 @@ license.workspace = true
 anyhow.workspace = true
 crossterm.workspace = true
 ratatui.workspace = true
+tokio.workspace = true
+job-agent-api = { path = "../../crates/api" }
+job-agent-storage = { path = "../../crates/storage" }
