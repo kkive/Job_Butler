@@ -1,4 +1,4 @@
-﻿[package]
+[package]
 name = "job-agent-storage"
 version.workspace = true
 edition.workspace = true
@@ -8,6 +8,8 @@ license.workspace = true
 sqlx.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+serde.workspace = true
 
 [dev-dependencies]
 tempfile = "3.15"
+

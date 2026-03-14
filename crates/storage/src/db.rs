@@ -16,7 +16,7 @@ pub struct DatabaseInitReport {
     pub backup_path: Option<PathBuf>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ServiceProvider {
     pub id: i64,
     pub provider_name: String,
@@ -25,7 +25,7 @@ pub struct ServiceProvider {
     pub api_key: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct NewServiceProvider {
     pub provider_name: String,
     pub model_name: String,

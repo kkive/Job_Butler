@@ -1,0 +1,7 @@
+# python/planner/requirements.txt
+langchain-openai>=0.2.6
+langgraph>=0.2.30
+pyautogui>=0.9.54
+pillow>=10.2.0
+requests>=2.31.0
+

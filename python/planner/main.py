@@ -1,15 +1,28 @@
-import argparse
+﻿import argparse
 import base64
 import json
 import os
 import re
+import sys
 import time
 from pathlib import Path
 from typing import Literal, TypedDict
 
+import requests
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
 from langgraph.graph import END, StateGraph
+
+OMNIPARSER_ROOT = Path("python/OmniParser-master").resolve()
+OMNIPARSER_UTIL = OMNIPARSER_ROOT / "util"
+
+if str(OMNIPARSER_UTIL) not in sys.path:
+    sys.path.insert(0, str(OMNIPARSER_UTIL))
+
+try:
+    from omniparser import Omniparser
+except Exception:
+    Omniparser = None
 
 
 class GraphState(TypedDict):
@@ -28,14 +41,39 @@ class GraphState(TypedDict):
     max_steps: int
 
 
-def build_llm(model: str) -> ChatOpenAI:
-    api_key = os.getenv("SILICONFLOW_API_KEY") or os.getenv("OPENAI_API_KEY")
+class ProviderConfig(TypedDict):
+    provider_name: str
+    model_name: str
+    api_url: str
+    api_key: str
+
+
+def load_provider_config(provider_name: str, db_path: str | None = None) -> ProviderConfig:
+    api_base = os.getenv("JOB_AGENT_API_BASE", "http://127.0.0.1:54001")
+    url = f"{api_base}/services/{provider_name}"
+    resp = requests.get(url, timeout=10)
+    if resp.status_code == 404:
+        raise ValueError(f"服务商不存在: {provider_name}")
+    resp.raise_for_status()
+    return resp.json()
+
+
+def build_llm(provider_name: str, model_override: str | None = None) -> ChatOpenAI:
+    cfg = load_provider_config(provider_name)
+    model = model_override or cfg["model_name"]
+    api_key = cfg["api_key"]
+    api_url = cfg["api_url"]
     if not api_key:
-        raise ValueError("请先设置 SILICONFLOW_API_KEY 或 OPENAI_API_KEY")
+        raise ValueError("api_key 为空，请在数据库中配置服务商")
+    if not api_url:
+        raise ValueError("api_url 为空，请在数据库中配置服务商")
+    if not model:
+        raise ValueError("model_name 为空，请在数据库中配置服务商")
+
     return ChatOpenAI(
         model=model,
         temperature=0,
-        base_url="https://api.siliconflow.cn/v1",
+        base_url=api_url,
         api_key=api_key,
     )
 
@@ -44,7 +82,7 @@ def require_pyautogui():
     try:
         import pyautogui  # type: ignore
     except ModuleNotFoundError as exc:
-        raise ModuleNotFoundError("缺少依赖 pyautogui，请先执行: pip install pyautogui") from exc
+        raise ModuleNotFoundError("缺少依赖 pyautogui，请先执行 pip install pyautogui") from exc
     return pyautogui
 
 
@@ -79,29 +117,51 @@ def tool_capture_screen(tool_input: str) -> str:
     return str(output_path.resolve())
 
 
-def tool_detect_clickable_buttons(tool_input: str, llm: ChatOpenAI, screenshot_path: str) -> str:
+def _init_omniparser() -> Omniparser:
+    if Omniparser is None:
+        raise RuntimeError("OmniParser 不可用，请确认依赖和路径")
+
+    config = {
+        "som_model_path": str(OMNIPARSER_ROOT / "weights" / "icon_detect" / "model.pt"),
+        "caption_model_name": "florence2",
+        "caption_model_path": str(OMNIPARSER_ROOT / "weights" / "icon_caption"),
+        "BOX_TRESHOLD": 0.01,
+    }
+    return Omniparser(config)
+
+
+def tool_detect_clickable_buttons(tool_input: str, screenshot_path: str) -> str:
     if not screenshot_path or not Path(screenshot_path).exists():
         raise ValueError("当前没有可用截图，请先执行截图工具")
 
+    parser = _init_omniparser()
     image_base64 = encode_image(screenshot_path)
-    prompt = (
-        "你是屏幕 UI 分析器。请根据截图识别当前屏幕上可能可点击的按钮、标签页、输入框入口、关闭按钮、发送按钮。"
-        "返回严格 JSON，格式如下："
-        "{\"items\":[{\"name\":\"按钮名称\",\"x\":123,\"y\":456,\"reason\":\"为什么可点击\"}]}"
-        "坐标必须是屏幕上的像素坐标，name 要简洁，最多返回 10 个候选项。"
-        f"用户目标：{tool_input}"
-    )
-    message = HumanMessage(
-        content=[
-            {"type": "text", "text": prompt},
-            {
-                "type": "image_url",
-                "image_url": {"url": f"data:image/png;base64,{image_base64}"},
-            },
-        ]
-    )
-    response = llm.invoke([message])
-    return response.content
+    _, parsed_content = parser.parse(image_base64)
+
+    items = []
+    from PIL import Image
+
+    with Image.open(screenshot_path) as img:
+        width, height = img.size
+
+    for idx, elem in enumerate(parsed_content):
+        bbox = elem.get("bbox") if isinstance(elem, dict) else None
+        content = elem.get("content") if isinstance(elem, dict) else ""
+        interactable = elem.get("interactivity", True) if isinstance(elem, dict) else True
+        if not bbox or len(bbox) < 4:
+            continue
+        x1, y1, x2, y2 = bbox[:4]
+        cx = int(((x1 + x2) / 2) * width)
+        cy = int(((y1 + y2) / 2) * height)
+        items.append({
+            "name": content or f"item_{idx}",
+            "x": cx,
+            "y": cy,
+            "reason": "omniparser-detected",
+            "interactable": interactable,
+        })
+
+    return json.dumps({"items": items}, ensure_ascii=False)
 
 
 def tool_click_screen(tool_input: str) -> str:
@@ -112,7 +172,7 @@ def tool_click_screen(tool_input: str) -> str:
     if x is None or y is None:
         raise ValueError("点击工具需要 JSON 输入，例如 {\"x\":100,\"y\":200}")
     pyautogui.click(int(x), int(y))
-    return f"已点击坐标 ({int(x)}, {int(y)})"
+    return f"已点击坐标({int(x)}, {int(y)})"
 
 
 def tool_scroll_wheel(tool_input: str) -> str:
@@ -136,7 +196,7 @@ def tool_input_text(tool_input: str) -> str:
     return f"已输入文本：{text}"
 
 
-def build_graph(planner_llm: ChatOpenAI, vision_llm: ChatOpenAI):
+def build_graph(planner_llm: ChatOpenAI):
     def think_node(state: GraphState) -> GraphState:
         messages = [
             SystemMessage(content="你是电脑操作代理的思考器。请用中文简短分析当前目标与风险。"),
@@ -206,7 +266,7 @@ def build_graph(planner_llm: ChatOpenAI, vision_llm: ChatOpenAI):
                     "step_count": state["step_count"] + 1,
                 }
             if name == "detect_clickable_buttons":
-                output = tool_detect_clickable_buttons(tool_input, vision_llm, state["screenshot_path"])
+                output = tool_detect_clickable_buttons(tool_input, state["screenshot_path"])
                 return {
                     **state,
                     "tool_output": output,
@@ -244,7 +304,7 @@ def build_graph(planner_llm: ChatOpenAI, vision_llm: ChatOpenAI):
                 "error": f"未知工具：{name}",
                 "step_count": state["step_count"] + 1,
             }
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             return {
                 **state,
                 "tool_output": "",
@@ -317,14 +377,14 @@ def main():
     parser = argparse.ArgumentParser(description="基于截图驱动的 LangGraph 电脑操作代理")
     parser.add_argument("goal", nargs="?", help="你的电脑操作目标")
     parser.add_argument(
-        "--model",
-        default="Qwen/Qwen2.5-72B-Instruct",
-        help="规划与决策模型",
+        "--provider",
+        default="siliconflow",
+        help="服务商名称（从数据库读取 api_url/api_key/model_name）",
     )
     parser.add_argument(
-        "--vision-model",
-        default="Qwen/Qwen2.5-VL-72B-Instruct",
-        help="截图识别模型",
+        "--model",
+        default="",
+        help="覆盖数据库中的模型名称（默认使用数据库配置）",
     )
     parser.add_argument(
         "--max-steps",
@@ -343,9 +403,8 @@ def main():
     if not goal:
         raise ValueError("目标不能为空")
 
-    planner_llm = build_llm(args.model)
-    vision_llm = build_llm(args.vision_model)
-    graph = build_graph(planner_llm, vision_llm)
+    planner_llm = build_llm(args.provider, args.model if args.model else None)
+    graph = build_graph(planner_llm)
 
     init_state: GraphState = {
         "goal": goal,

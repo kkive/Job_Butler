@@ -8,6 +8,21 @@ use job_agent_storage::{
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
+mod http;
+
+pub use http::run_http_server;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StartTaskRequest {
+    pub requirement: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StartTaskResponse {
+    pub accepted: bool,
+    pub requirement: String,
+}
+
 pub async fn view_service_providers<P: AsRef<Path>>(db_path: P) -> Result<Vec<ServiceProvider>> {
     let services = list_service_providers(db_path).await?;
     Ok(services)

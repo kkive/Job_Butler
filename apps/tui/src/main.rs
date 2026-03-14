@@ -1,5 +1,7 @@
 ﻿use std::io;
-use std::time::Duration;
+use std::net::SocketAddr;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use crossterm::event::{
@@ -10,12 +12,12 @@ use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
-use job_agent_api::{
-    add_service_provider_via_api, delete_service_provider_via_api, view_service_providers,
-};
+use job_agent_api::{run_http_server, StartTaskRequest, StartTaskResponse};
 use job_agent_storage::{
-    default_db_path, init_or_recover_database, NewServiceProvider, ServiceProvider,
+    default_db_path, NewServiceProvider, ServiceProvider,
 };
+use reqwest::blocking::Client;
+use serde::Deserialize;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -28,6 +30,7 @@ const COLOR_BG: Color = Color::Black;
 const COLOR_TEXT: Color = Color::White;
 const COLOR_POPUP_THEME: Color = Color::Rgb(244, 209, 180); // #F4D1B4
 const COLOR_POPUP_TEXT: Color = Color::Black;
+const API_BASE: &str = "http://127.0.0.1:54001";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Tab {
@@ -88,6 +91,8 @@ struct App {
     selected_setting: usize,
     ui_regions: UiRegions,
     popup: Popup,
+    home_intro_input: String,
+    started_at: Instant,
 }
 
 impl App {
@@ -100,6 +105,8 @@ impl App {
             selected_setting: 0,
             ui_regions: UiRegions::default(),
             popup: Popup::None,
+            home_intro_input: String::new(),
+            started_at: Instant::now(),
         }
     }
 
@@ -140,7 +147,7 @@ impl App {
     fn activate_current(&mut self) {
         match self.active_tab {
             Tab::Home => {
-                self.status = "已触发：开始任务（示例动作）".to_string();
+                self.start_home_task();
             }
             Tab::Task => {
                 self.status = "任务页：待接入任务列表与执行进度".to_string();
@@ -327,6 +334,26 @@ impl App {
         }
     }
 
+    fn start_home_task(&mut self) {
+        let requirement = self.home_intro_input.trim().to_string();
+        if requirement.is_empty() {
+            self.status = "请先输入任务需求".to_string();
+            return;
+        }
+
+        match start_task(requirement.clone()) {
+            Ok(response) if response.accepted => {
+                self.status = format!("任务已提交：{}", response.requirement);
+            }
+            Ok(_) => {
+                self.status = "任务提交失败：后端未接受请求".to_string();
+            }
+            Err(e) => {
+                self.status = format!("任务提交失败: {e}");
+            }
+        }
+    }
+
     fn on_key(&mut self, code: KeyCode) {
         if self.handle_popup_key(code) {
             return;
@@ -345,6 +372,16 @@ impl App {
             KeyCode::Down => {
                 if self.active_tab == Tab::Settings {
                     self.next_setting();
+                }
+            }
+            KeyCode::Backspace => {
+                if self.active_tab == Tab::Home {
+                    self.home_intro_input.pop();
+                }
+            }
+            KeyCode::Char(c) => {
+                if self.active_tab == Tab::Home && !c.is_control() {
+                    self.home_intro_input.push(c);
                 }
             }
             KeyCode::Enter => self.activate_current(),
@@ -402,28 +439,49 @@ fn active_form_field_mut(form: &mut AddServicePopup) -> &mut String {
 }
 
 fn fetch_service_providers() -> Result<Vec<ServiceProvider>> {
-    let db_path = default_db_path();
-    let runtime = tokio::runtime::Runtime::new()?;
-    let list = runtime.block_on(view_service_providers(&db_path))?;
-    Ok(list)
+    let url = format!("{API_BASE}/services");
+    let client = Client::new();
+    let resp = client.get(url).send()?.error_for_status()?;
+    Ok(resp.json::<Vec<ServiceProvider>>()?)
 }
 
 fn add_service(input: NewServiceProvider) -> Result<i64> {
-    let db_path = default_db_path();
-    let runtime = tokio::runtime::Runtime::new()?;
-    let id = runtime.block_on(add_service_provider_via_api(&db_path, input))?;
-    Ok(id)
+    #[derive(Deserialize)]
+    struct AddServiceResponse {
+        id: i64,
+    }
+
+    let url = format!("{API_BASE}/services");
+    let client = Client::new();
+    let resp = client.post(url).json(&input).send()?.error_for_status()?;
+    let body = resp.json::<AddServiceResponse>()?;
+    Ok(body.id)
 }
 
 fn delete_service(id: i64) -> Result<bool> {
-    let db_path = default_db_path();
-    let runtime = tokio::runtime::Runtime::new()?;
-    let deleted = runtime.block_on(delete_service_provider_via_api(&db_path, id))?;
-    Ok(deleted)
+    #[derive(Deserialize)]
+    struct DeleteServiceResponse {
+        deleted: bool,
+    }
+
+    let url = format!("{API_BASE}/services/id/{id}");
+    let client = Client::new();
+    let resp = client.delete(url).send()?.error_for_status()?;
+    let body = resp.json::<DeleteServiceResponse>()?;
+    Ok(body.deleted)
+}
+
+fn start_task(requirement: String) -> Result<StartTaskResponse> {
+    let url = format!("{API_BASE}/tasks/start");
+    let client = Client::new();
+    let input = StartTaskRequest { requirement };
+    let resp = client.post(url).json(&input).send()?.error_for_status()?;
+    Ok(resp.json::<StartTaskResponse>()?)
 }
 
 fn main() -> Result<()> {
-    initialize_database_before_ui()?;
+    start_api_server();
+    wait_for_api_ready()?;
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -444,18 +502,32 @@ fn main() -> Result<()> {
     result
 }
 
-fn initialize_database_before_ui() -> Result<()> {
-    let db_path = default_db_path();
-    let runtime = tokio::runtime::Runtime::new()?;
-    let report = runtime.block_on(init_or_recover_database(&db_path))?;
-
-    if report.recovered_from_corruption {
-        eprintln!("database recovered: {}", report.db_path.display());
+fn wait_for_api_ready() -> Result<()> {
+    let url = format!("{API_BASE}/health");
+    let client = Client::new();
+    for _ in 0..30 {
+        if let Ok(resp) = client.get(&url).send() {
+            if resp.status().is_success() {
+                return Ok(());
+            }
+        }
+        thread::sleep(Duration::from_millis(100));
     }
-
-    Ok(())
+    Err(anyhow::anyhow!("api server not ready"))
 }
+fn start_api_server() {
+    let db_path = default_db_path();
+    let addr: SocketAddr = "127.0.0.1:54001"
+        .parse()
+        .expect("invalid api address");
 
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Runtime::new().expect("failed to build tokio runtime");
+        if let Err(err) = runtime.block_on(run_http_server(db_path, addr)) {
+            eprintln!("api server failed: {err}");
+        }
+    });
+}
 fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
     let mut app = App::new();
 
@@ -542,7 +614,15 @@ fn draw_ui(f: &mut Frame<'_>, app: &App) -> UiRegions {
 
     match app.active_tab {
         Tab::Home => {
-            regions.start_button = render_home(f, chunks[1]);
+            let input_focused = matches!(app.popup, Popup::None);
+            let cursor_visible = (app.started_at.elapsed().as_millis() / 500) % 2 == 0;
+            regions.start_button = render_home(
+                f,
+                chunks[1],
+                &app.home_intro_input,
+                input_focused,
+                cursor_visible,
+            );
         }
         Tab::Task => {
             render_task(f, chunks[1]);
@@ -571,7 +651,13 @@ fn draw_ui(f: &mut Frame<'_>, app: &App) -> UiRegions {
     regions
 }
 
-fn render_home(f: &mut Frame<'_>, area: Rect) -> Option<Rect> {
+fn render_home(
+    f: &mut Frame<'_>,
+    area: Rect,
+    intro_input: &str,
+    input_focused: bool,
+    cursor_visible: bool,
+) -> Option<Rect> {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -617,18 +703,55 @@ fn render_home(f: &mut Frame<'_>, area: Rect) -> Option<Rect> {
     );
     f.render_widget(logo, chunks[0]);
 
-    let intro = Paragraph::new(vec![
-        Line::from("Job-Agent: AutoGen + OmniParser + 鼠标控制 的自动求职系统"),
-        Line::from("在本页面可直接开始任务。支持键盘和鼠标交互。"),
-    ])
-    .style(Style::default().fg(COLOR_TEXT).bg(COLOR_BG))
-    .alignment(Alignment::Left)
-    .block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title(" 项目介绍 ")
-            .border_style(Style::default().fg(COLOR_ACCENT)),
-    );
+    let mut input_spans = if intro_input.is_empty() {
+        vec![Span::styled(
+            "请输入任务需求...",
+            Style::default().fg(Color::DarkGray),
+        )]
+    } else {
+        vec![Span::styled(
+            intro_input,
+            Style::default()
+                .fg(COLOR_TEXT)
+                .bg(COLOR_BG)
+                .add_modifier(Modifier::BOLD),
+        )]
+    };
+
+    if input_focused && cursor_visible {
+        input_spans.push(Span::styled(
+            " ",
+            Style::default().fg(COLOR_BG).bg(COLOR_ACCENT),
+        ));
+    }
+
+    let intro_title = if input_focused {
+        " 任务需求（输入中） "
+    } else {
+        " 任务需求（输入框） "
+    };
+    let intro_border_style = if input_focused {
+        Style::default()
+            .fg(COLOR_ACCENT)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(COLOR_ACCENT)
+    };
+
+    let intro = Paragraph::new(vec![Line::from(input_spans)])
+        .style(
+            Style::default()
+                .fg(COLOR_TEXT)
+                .bg(COLOR_BG)
+                .add_modifier(Modifier::BOLD),
+        )
+        .alignment(Alignment::Left)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(intro_title)
+                .border_style(intro_border_style),
+        );
     f.render_widget(intro, chunks[1]);
 
     let start_button = centered_rect(chunks[2], 22, 3);
@@ -895,5 +1018,19 @@ fn render_menu_button(f: &mut Frame<'_>, area: Rect, label: &str, selected: bool
 
     f.render_widget(button, area);
 }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 

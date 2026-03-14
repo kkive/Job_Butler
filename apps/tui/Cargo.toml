@@ -1,4 +1,4 @@
-﻿[package]
+[package]
 name = "job-agent-tui"
 version.workspace = true
 edition.workspace = true
@@ -8,6 +8,9 @@ license.workspace = true
 anyhow.workspace = true
 crossterm.workspace = true
 ratatui.workspace = true
+reqwest.workspace = true
+serde.workspace = true
 tokio.workspace = true
 job-agent-api = { path = "../../crates/api" }
 job-agent-storage = { path = "../../crates/storage" }
+
