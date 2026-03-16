@@ -1,5 +1,8 @@
 ﻿use std::io;
 use std::net::SocketAddr;
+use std::path::PathBuf;
+use std::process::{Child, Command, Stdio};
+use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -12,18 +15,19 @@ use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
-use job_agent_api::{run_http_server, StartTaskRequest, StartTaskResponse};
+use job_agent_api::run_http_server;
 use job_agent_storage::{
     default_db_path, NewServiceProvider, ServiceProvider,
 };
 use reqwest::blocking::Client;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph};
 use ratatui::{Frame, Terminal};
+use tungstenite::{connect, Message};
 
 const COLOR_ACCENT: Color = Color::Rgb(110, 228, 149);
 const COLOR_BG: Color = Color::Black;
@@ -31,6 +35,8 @@ const COLOR_TEXT: Color = Color::White;
 const COLOR_POPUP_THEME: Color = Color::Rgb(244, 209, 180); // #F4D1B4
 const COLOR_POPUP_TEXT: Color = Color::Black;
 const API_BASE: &str = "http://127.0.0.1:54001";
+const BRIDGE_API_BASE: &str = "http://127.0.0.1:55002";
+const BRIDGE_WS_LOG_URL: &str = "ws://127.0.0.1:55002/ws/logs";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Tab {
@@ -45,6 +51,7 @@ struct UiRegions {
     task_tab: Rect,
     settings_tab: Rect,
     start_button: Option<Rect>,
+    task_cancel_button: Option<Rect>,
     setting_rows: Vec<Rect>,
 }
 
@@ -55,6 +62,7 @@ impl Default for UiRegions {
             task_tab: Rect::default(),
             settings_tab: Rect::default(),
             start_button: None,
+            task_cancel_button: None,
             setting_rows: Vec::new(),
         }
     }
@@ -83,6 +91,60 @@ enum Popup {
     DeleteService(ServiceListPopup),
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct PlannerTaskSubmitRequest {
+    goal: String,
+    provider: String,
+    model: Option<String>,
+    max_steps: i32,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct PlannerTaskSubmitResponse {
+    task_id: String,
+    status: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct PlannerTaskStatusResponse {
+    status: String,
+    stage: String,
+    message: String,
+    progress: u8,
+    step_count: i32,
+    max_steps: i32,
+    error: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct PlannerEvent {
+    seq: i32,
+    #[serde(rename = "type")]
+    event_type: String,
+    stage: String,
+    message: String,
+    timestamp: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct PlannerTaskEventsResponse {
+    events: Vec<PlannerEvent>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct PlannerTaskCancelResponse {
+    task_id: String,
+    cancelled: bool,
+    status: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct BridgeHealthResponse {
+    status: String,
+    service: String,
+    version: String,
+}
+
 struct App {
     running: bool,
     active_tab: Tab,
@@ -93,6 +155,18 @@ struct App {
     popup: Popup,
     home_intro_input: String,
     started_at: Instant,
+    current_task_id: Option<String>,
+    task_status: String,
+    task_stage: String,
+    task_message: String,
+    task_progress: u8,
+    task_step_count: i32,
+    task_max_steps: i32,
+    task_error: String,
+    task_events: Vec<PlannerEvent>,
+    last_task_poll_at: Instant,
+    last_bridge_probe_at: Instant,
+    bridge_logs: Vec<String>,
 }
 
 impl App {
@@ -107,6 +181,18 @@ impl App {
             popup: Popup::None,
             home_intro_input: String::new(),
             started_at: Instant::now(),
+            current_task_id: None,
+            task_status: "idle".to_string(),
+            task_stage: "queued".to_string(),
+            task_message: "等待任务开始".to_string(),
+            task_progress: 0,
+            task_step_count: 0,
+            task_max_steps: 0,
+            task_error: String::new(),
+            task_events: Vec::new(),
+            last_task_poll_at: Instant::now(),
+            last_bridge_probe_at: Instant::now() - Duration::from_secs(10),
+            bridge_logs: Vec::new(),
         }
     }
 
@@ -150,7 +236,7 @@ impl App {
                 self.start_home_task();
             }
             Tab::Task => {
-                self.status = "任务页：待接入任务列表与执行进度".to_string();
+                self.poll_task_updates();
             }
             Tab::Settings => {
                 self.handle_settings_action();
@@ -341,15 +427,112 @@ impl App {
             return;
         }
 
-        match start_task(requirement.clone()) {
-            Ok(response) if response.accepted => {
-                self.status = format!("任务已提交：{}", response.requirement);
-            }
-            Ok(_) => {
-                self.status = "任务提交失败：后端未接受请求".to_string();
+        match submit_planner_task(requirement.clone(), 12) {
+            Ok(response) if response.status == "accepted" => {
+                self.current_task_id = Some(response.task_id.clone());
+                self.task_status = "pending".to_string();
+                self.task_stage = "queued".to_string();
+                self.task_message = "任务已提交，等待 bridge 执行".to_string();
+                self.task_progress = 0;
+                self.task_step_count = 0;
+                self.task_max_steps = 12;
+                self.task_error.clear();
+                self.task_events.clear();
+                self.last_task_poll_at = Instant::now() - Duration::from_secs(1);
+                self.active_tab = Tab::Task;
+                self.status = format!("任务已提交，task_id={}", response.task_id);
             }
             Err(e) => {
                 self.status = format!("任务提交失败: {e}");
+            }
+            Ok(response) => {
+                self.status = format!("任务提交失败：后端状态={}", response.status);
+            }
+        }
+    }
+
+    fn poll_task_updates(&mut self) {
+        let Some(task_id) = self.current_task_id.clone() else {
+            return;
+        };
+        if self.last_task_poll_at.elapsed() < Duration::from_millis(500) {
+            return;
+        }
+        self.last_task_poll_at = Instant::now();
+
+        match fetch_planner_task_status(&task_id) {
+            Ok(task) => {
+                self.task_status = task.status.clone();
+                self.task_stage = task.stage.clone();
+                self.task_message = task.message.clone();
+                self.task_progress = task.progress;
+                self.task_step_count = task.step_count;
+                self.task_max_steps = task.max_steps;
+                self.task_error = task.error.unwrap_or_default();
+                self.status = format!(
+                    "任务状态：{} | 阶段：{} | {}%",
+                    self.task_status, self.task_stage, self.task_progress
+                );
+                if let Ok(events) = fetch_planner_task_events(&task_id) {
+                    self.task_events = events.events;
+                }
+                if matches!(self.task_status.as_str(), "success" | "failed" | "cancelled" | "timeout")
+                {
+                    if !task.message.is_empty() {
+                        self.status = format!("任务结束：{}（{}）", self.task_status, task.message);
+                    }
+                }
+            }
+            Err(e) => {
+                self.status = format!("任务状态拉取失败: {e}");
+            }
+        }
+    }
+
+    fn poll_bridge_snapshot(&mut self) {
+        if self.last_bridge_probe_at.elapsed() < Duration::from_secs(5) {
+            return;
+        }
+        self.last_bridge_probe_at = Instant::now();
+        match fetch_bridge_health() {
+            Ok(health) => {
+                let _ = (&health.status, &health.service, &health.version);
+            }
+            Err(e) => {
+                self.status = format!("bridge 健康检查失败: {e}");
+            }
+        }
+    }
+
+    fn push_bridge_log(&mut self, line: String) {
+        self.bridge_logs.push(line);
+        if self.bridge_logs.len() > 300 {
+            let keep_from = self.bridge_logs.len() - 300;
+            self.bridge_logs = self.bridge_logs.split_off(keep_from);
+        }
+    }
+
+    fn poll_runtime_logs(&mut self, log_rx: &Receiver<String>) {
+        while let Ok(line) = log_rx.try_recv() {
+            self.push_bridge_log(line);
+        }
+    }
+
+    fn cancel_current_task(&mut self) {
+        let Some(task_id) = self.current_task_id.clone() else {
+            self.status = "暂无可取消任务".to_string();
+            return;
+        };
+        match cancel_planner_task(&task_id) {
+            Ok(resp) if resp.cancelled => {
+                self.task_status = resp.status.clone();
+                self.status = format!("已发送取消请求，task_id={}", resp.task_id);
+            }
+            Ok(resp) => {
+                self.status = format!("取消失败，后端状态={}", resp.status);
+            }
+            Err(e) => {
+                self.status = format!("取消任务失败: {e}");
             }
         }
     }
@@ -415,7 +598,13 @@ impl App {
                     }
                 }
             }
-            Tab::Task => {}
+            Tab::Task => {
+                if let Some(btn) = self.ui_regions.task_cancel_button {
+                    if in_rect(btn, x, y) {
+                        self.cancel_current_task();
+                    }
+                }
+            }
             Tab::Settings => {
                 for (idx, rect) in self.ui_regions.setting_rows.iter().enumerate() {
                     if in_rect(*rect, x, y) {
@@ -438,9 +627,17 @@ fn active_form_field_mut(form: &mut AddServicePopup) -> &mut String {
     }
 }
 
+fn short_timeout_client() -> Result<Client> {
+    Ok(Client::builder().timeout(Duration::from_millis(900)).build()?)
+}
+
+fn medium_timeout_client() -> Result<Client> {
+    Ok(Client::builder().timeout(Duration::from_secs(3)).build()?)
+}
+
 fn fetch_service_providers() -> Result<Vec<ServiceProvider>> {
     let url = format!("{API_BASE}/services");
-    let client = Client::new();
+    let client = short_timeout_client()?;
     let resp = client.get(url).send()?.error_for_status()?;
     Ok(resp.json::<Vec<ServiceProvider>>()?)
 }
@@ -452,7 +649,7 @@ fn add_service(input: NewServiceProvider) -> Result<i64> {
     }
 
     let url = format!("{API_BASE}/services");
-    let client = Client::new();
+    let client = short_timeout_client()?;
     let resp = client.post(url).json(&input).send()?.error_for_status()?;
     let body = resp.json::<AddServiceResponse>()?;
     Ok(body.id)
@@ -465,23 +662,58 @@ fn delete_service(id: i64) -> Result<bool> {
     }
 
     let url = format!("{API_BASE}/services/id/{id}");
-    let client = Client::new();
+    let client = short_timeout_client()?;
     let resp = client.delete(url).send()?.error_for_status()?;
     let body = resp.json::<DeleteServiceResponse>()?;
     Ok(body.deleted)
 }
 
-fn start_task(requirement: String) -> Result<StartTaskResponse> {
-    let url = format!("{API_BASE}/tasks/start");
-    let client = Client::new();
-    let input = StartTaskRequest { requirement };
+fn submit_planner_task(goal: String, max_steps: i32) -> Result<PlannerTaskSubmitResponse> {
+    let url = format!("{BRIDGE_API_BASE}/planner/tasks");
+    let client = short_timeout_client()?;
+    let input = PlannerTaskSubmitRequest {
+        goal,
+        provider: "siliconflow".to_string(),
+        model: None,
+        max_steps,
+    };
     let resp = client.post(url).json(&input).send()?.error_for_status()?;
-    Ok(resp.json::<StartTaskResponse>()?)
+    Ok(resp.json::<PlannerTaskSubmitResponse>()?)
+}
+
+fn fetch_planner_task_status(task_id: &str) -> Result<PlannerTaskStatusResponse> {
+    let url = format!("{BRIDGE_API_BASE}/planner/tasks/{task_id}");
+    let client = short_timeout_client()?;
+    let resp = client.get(url).send()?.error_for_status()?;
+    Ok(resp.json::<PlannerTaskStatusResponse>()?)
+}
+
+fn fetch_planner_task_events(task_id: &str) -> Result<PlannerTaskEventsResponse> {
+    let url = format!("{BRIDGE_API_BASE}/planner/tasks/{task_id}/events");
+    let client = short_timeout_client()?;
+    let resp = client.get(url).send()?.error_for_status()?;
+    Ok(resp.json::<PlannerTaskEventsResponse>()?)
+}
+
+fn cancel_planner_task(task_id: &str) -> Result<PlannerTaskCancelResponse> {
+    let url = format!("{BRIDGE_API_BASE}/planner/tasks/{task_id}/cancel");
+    let client = short_timeout_client()?;
+    let resp = client.post(url).send()?.error_for_status()?;
+    Ok(resp.json::<PlannerTaskCancelResponse>()?)
+}
+
+fn fetch_bridge_health() -> Result<BridgeHealthResponse> {
+    let url = format!("{BRIDGE_API_BASE}/health");
+    let client = short_timeout_client()?;
+    let resp = client.get(url).send()?.error_for_status()?;
+    Ok(resp.json::<BridgeHealthResponse>()?)
 }
 
 fn main() -> Result<()> {
     start_api_server();
     wait_for_api_ready()?;
+    let mut bridge_child = ensure_bridge_server()?;
+    let bridge_log_rx = start_bridge_log_stream();
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -489,7 +721,7 @@ fn main() -> Result<()> {
 
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
-    let result = run_app(&mut terminal);
+    let result = run_app(&mut terminal, bridge_log_rx.as_ref());
 
     disable_raw_mode()?;
     execute!(
@@ -498,13 +730,16 @@ fn main() -> Result<()> {
         DisableMouseCapture
     )?;
     terminal.show_cursor()?;
+    if let Some(child) = bridge_child.as_mut() {
+        let _ = child.kill();
+    }
 
     result
 }
 
 fn wait_for_api_ready() -> Result<()> {
     let url = format!("{API_BASE}/health");
-    let client = Client::new();
+    let client = medium_timeout_client()?;
     for _ in 0..30 {
         if let Ok(resp) = client.get(&url).send() {
             if resp.status().is_success() {
@@ -515,6 +750,122 @@ fn wait_for_api_ready() -> Result<()> {
     }
     Err(anyhow::anyhow!("api server not ready"))
 }
+
+fn wait_for_bridge_ready() -> Result<()> {
+    let url = format!("{BRIDGE_API_BASE}/health");
+    let client = medium_timeout_client()?;
+    for _ in 0..60 {
+        if let Ok(resp) = client.get(&url).send() {
+            if resp.status().is_success() {
+                return Ok(());
+            }
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    Err(anyhow::anyhow!("bridge server not ready"))
+}
+
+fn bridge_python_app_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("python")
+}
+
+fn ensure_bridge_server() -> Result<Option<Child>> {
+    let url = format!("{BRIDGE_API_BASE}/health");
+    let client = medium_timeout_client()?;
+    if let Ok(resp) = client.get(&url).send() {
+        if resp.status().is_success() {
+            return Ok(None);
+        }
+    }
+
+    let app_dir = bridge_python_app_dir();
+    let app_dir = app_dir.to_string_lossy().to_string();
+    let child = Command::new("conda")
+        .args([
+            "run",
+            "-n",
+            "omni",
+            // 注意这是测试环境使用的命令，正式环境请替换为合适的启动命令
+            "python",
+            "-m",
+            "uvicorn",
+            "bridge.main:app",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            "55002",
+            "--app-dir",
+        ])
+        .arg(app_dir)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    wait_for_bridge_ready()?;
+    Ok(Some(child))
+}
+
+fn start_bridge_log_stream() -> Option<Receiver<String>> {
+    let (tx, rx) = mpsc::channel::<String>();
+    let builder = thread::Builder::new().name("bridge-log-ws".to_string());
+    if builder
+        .spawn(move || {
+            loop {
+                match connect(BRIDGE_WS_LOG_URL) {
+                    Ok((mut socket, _)) => {
+                        if tx.send("[ws] 已连接 bridge 实时日志".to_string()).is_err() {
+                            break;
+                        }
+                        loop {
+                            let next = socket.read();
+                            match next {
+                                Ok(Message::Text(text)) => {
+                                    if tx.send(text.to_string()).is_err() {
+                                        return;
+                                    }
+                                }
+                                Ok(Message::Binary(bytes)) => {
+                                    if let Ok(text) = String::from_utf8(bytes.to_vec()) {
+                                        if tx.send(text).is_err() {
+                                            return;
+                                        }
+                                    }
+                                }
+                                Ok(Message::Close(_)) => {
+                                    let _ = tx.send("[ws] bridge 日志连接已关闭，准备重连".to_string());
+                                    break;
+                                }
+                                Ok(_) => {}
+                                Err(err) => {
+                                    if tx.send(format!("[ws] bridge 日志流错误: {err}")).is_err() {
+                                        return;
+                                    }
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        if tx
+                            .send(format!("[ws] 连接 bridge 日志失败: {err}"))
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                }
+                thread::sleep(Duration::from_secs(1));
+            }
+        })
+        .is_err()
+    {
+        return None;
+    }
+    Some(rx)
+}
+
 fn start_api_server() {
     let db_path = default_db_path();
     let addr: SocketAddr = "127.0.0.1:54001"
@@ -528,10 +879,19 @@ fn start_api_server() {
         }
     });
 }
-fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
+fn run_app(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    bridge_log_rx: Option<&Receiver<String>>,
+) -> Result<()> {
     let mut app = App::new();
 
     while app.running {
+        app.poll_task_updates();
+        app.poll_bridge_snapshot();
+        if let Some(rx) = bridge_log_rx {
+            app.poll_runtime_logs(rx);
+        }
+
         terminal.draw(|f| {
             app.ui_regions = draw_ui(f, &app);
         })?;
@@ -609,6 +969,7 @@ fn draw_ui(f: &mut Frame<'_>, app: &App) -> UiRegions {
         task_tab,
         settings_tab,
         start_button: None,
+        task_cancel_button: None,
         setting_rows: Vec::new(),
     };
 
@@ -625,7 +986,7 @@ fn draw_ui(f: &mut Frame<'_>, app: &App) -> UiRegions {
             );
         }
         Tab::Task => {
-            render_task(f, chunks[1]);
+            regions.task_cancel_button = render_task(f, chunks[1], app);
         }
         Tab::Settings => {
             regions.setting_rows = render_settings(f, chunks[1], app);
@@ -817,7 +1178,7 @@ fn render_settings(f: &mut Frame<'_>, area: Rect, app: &App) -> Vec<Rect> {
     rows
 }
 
-fn render_task(f: &mut Frame<'_>, area: Rect) {
+fn render_task(f: &mut Frame<'_>, area: Rect, app: &App) -> Option<Rect> {
     let block = Block::default()
         .borders(Borders::ALL)
         .title(" 任务 ")
@@ -825,14 +1186,77 @@ fn render_task(f: &mut Frame<'_>, area: Rect) {
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    let content = Paragraph::new(vec![
+    let mut lines = vec![
         Line::from("任务中心"),
-        Line::from("后续接入：任务队列、执行进度、失败重试、日志追踪。"),
-    ])
-    .style(Style::default().fg(COLOR_TEXT).bg(COLOR_BG))
-    .alignment(Alignment::Left);
+        Line::from(format!(
+            "task_id: {}",
+            app.current_task_id
+                .clone()
+                .unwrap_or_else(|| "<暂无任务>".to_string())
+        )),
+        Line::from(format!("状态: {}", app.task_status)),
+        Line::from(format!("阶段: {}", app.task_stage)),
+        Line::from(format!("当前消息: {}", app.task_message)),
+        Line::from(format!(
+            "进度: {}% (步数 {}/{})",
+            app.task_progress, app.task_step_count, app.task_max_steps
+        )),
+    ];
+    if !app.task_error.is_empty() {
+        lines.push(Line::from(format!("错误: {}", app.task_error)));
+    }
+    lines.push(Line::from("最近事件:"));
+    for event in app.task_events.iter().rev().take(8).rev() {
+        lines.push(Line::from(format!(
+            "#{} [{}|{}] {} | {}",
+            event.seq, event.event_type, event.stage, event.timestamp, event.message
+        )));
+    }
+    lines.push(Line::from("实时Python日志(WS):"));
+    for log in app.bridge_logs.iter().rev().take(6).rev() {
+        lines.push(Line::from(log.clone()));
+    }
 
-    f.render_widget(content, inner);
+    let content = Paragraph::new(lines)
+        .style(Style::default().fg(COLOR_TEXT).bg(COLOR_BG))
+        .alignment(Alignment::Left);
+
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(3)])
+        .split(inner);
+    f.render_widget(content, sections[0]);
+
+    let cancel_button = Rect::new(
+        sections[1].x,
+        sections[1].y,
+        18.min(sections[1].width),
+        sections[1].height.min(3),
+    );
+    let cancel_text = if app.current_task_id.is_some() {
+        "[ 取消任务 ]"
+    } else {
+        "[ 暂无任务 ]"
+    };
+    let cancel_style = if app.current_task_id.is_some() {
+        Style::default()
+            .fg(COLOR_BG)
+            .bg(COLOR_ACCENT)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(COLOR_TEXT).bg(Color::DarkGray)
+    };
+    let cancel_btn = Paragraph::new(cancel_text)
+        .alignment(Alignment::Center)
+        .style(cancel_style)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(COLOR_ACCENT)),
+        );
+    f.render_widget(cancel_btn, cancel_button);
+
+    Some(cancel_button)
 }
 
 fn render_popup(f: &mut Frame<'_>, popup: &Popup, content_area: Rect) {
@@ -1018,11 +1442,6 @@ fn render_menu_button(f: &mut Frame<'_>, area: Rect, label: &str, selected: bool
 
     f.render_widget(button, area);
 }
-
-
-
-
-
 
 
 
