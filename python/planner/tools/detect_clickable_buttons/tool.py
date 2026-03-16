@@ -1,39 +1,27 @@
-﻿import base64
-import json
+﻿import json
+import shutil
 import sys
 from pathlib import Path
 
-from ..common import require_existing_file
-
-OMNIPARSER_ROOT = Path("python/OmniParser-master").resolve()
-OMNIPARSER_UTIL = OMNIPARSER_ROOT / "util"
-
-if str(OMNIPARSER_UTIL) not in sys.path:
-    sys.path.insert(0, str(OMNIPARSER_UTIL))
-
 try:
-    from omniparser import Omniparser
-except Exception:
-    Omniparser = None
+    from ..common import require_existing_file
+except ImportError:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from common import require_existing_file
+
+OMNIPARSER_ROOT = Path(__file__).resolve().parents[1] / "OmniParser"
 
 
-def encode_image(image_path: str) -> str:
-    with open(image_path, "rb") as file:
-        return base64.b64encode(file.read()).decode("utf-8")
-
-
-def _init_omniparser() -> Omniparser | None:
-    if Omniparser is None:
-        return None
-
-    config = {
-        "som_model_path": str(OMNIPARSER_ROOT / "weights" / "icon_detect" / "model.pt"),
-        "caption_model_name": "florence2",
-        "caption_model_path": str(OMNIPARSER_ROOT / "weights" / "icon_caption"),
-        "BOX_TRESHOLD": 0.01,
-    }
+def _run_omniparser() -> dict | None:
     try:
-        return Omniparser(config)
+        if str(OMNIPARSER_ROOT) not in sys.path:
+            sys.path.insert(0, str(OMNIPARSER_ROOT))
+        from main import main as omniparser_main
+
+        result = omniparser_main(include_annotated_image_base64=False)
+        if isinstance(result, dict):
+            return result
+        return None
     except Exception:
         return None
 
@@ -41,8 +29,13 @@ def _init_omniparser() -> Omniparser | None:
 def tool_detect_clickable_buttons(tool_input: str, screenshot_path: str) -> str:
     image_path = require_existing_file(screenshot_path, "current screenshot not found")
 
-    parser = _init_omniparser()
-    if parser is None:
+    # 统一复用 OmniParser 的固定输入文件路径。
+    omniparser_input = OMNIPARSER_ROOT / "image.png"
+    omniparser_input.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(image_path, omniparser_input)
+
+    result = _run_omniparser()
+    if result is None:
         payload = {
             "source_screenshot": str(image_path.resolve()),
             "items_count": 0,
@@ -51,8 +44,7 @@ def tool_detect_clickable_buttons(tool_input: str, screenshot_path: str) -> str:
         }
         return json.dumps(payload, ensure_ascii=False)
 
-    image_base64 = encode_image(str(image_path))
-    _, parsed_content = parser.parse(image_base64)
+    elements = result.get("elements", []) if isinstance(result, dict) else []
 
     items = []
     from PIL import Image
@@ -60,7 +52,7 @@ def tool_detect_clickable_buttons(tool_input: str, screenshot_path: str) -> str:
     with Image.open(image_path) as img:
         width, height = img.size
 
-    for idx, elem in enumerate(parsed_content):
+    for idx, elem in enumerate(elements):
         bbox = elem.get("bbox") if isinstance(elem, dict) else None
         content = elem.get("content") if isinstance(elem, dict) else ""
         interactable = elem.get("interactivity", True) if isinstance(elem, dict) else True
@@ -85,3 +77,8 @@ def tool_detect_clickable_buttons(tool_input: str, screenshot_path: str) -> str:
         "items": items,
     }
     return json.dumps(payload, ensure_ascii=False)
+
+
+if __name__ == "__main__":
+    screenshot = sys.argv[1] if len(sys.argv) > 1 else ""
+    print(tool_detect_clickable_buttons("", screenshot))

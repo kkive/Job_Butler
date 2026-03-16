@@ -1,4 +1,5 @@
 ﻿use std::io;
+use std::io::{BufRead, BufReader};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
@@ -7,6 +8,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
+use arboard::Clipboard;
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, MouseButton,
     MouseEventKind,
@@ -20,14 +22,13 @@ use job_agent_storage::{
     default_db_path, NewServiceProvider, ServiceProvider,
 };
 use reqwest::blocking::Client;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph};
 use ratatui::{Frame, Terminal};
-use tungstenite::{connect, Message};
 
 const COLOR_ACCENT: Color = Color::Rgb(110, 228, 149);
 const COLOR_BG: Color = Color::Black;
@@ -35,8 +36,6 @@ const COLOR_TEXT: Color = Color::White;
 const COLOR_POPUP_THEME: Color = Color::Rgb(244, 209, 180); // #F4D1B4
 const COLOR_POPUP_TEXT: Color = Color::Black;
 const API_BASE: &str = "http://127.0.0.1:54001";
-const BRIDGE_API_BASE: &str = "http://127.0.0.1:55002";
-const BRIDGE_WS_LOG_URL: &str = "ws://127.0.0.1:55002/ws/logs";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Tab {
@@ -52,6 +51,8 @@ struct UiRegions {
     settings_tab: Rect,
     start_button: Option<Rect>,
     task_cancel_button: Option<Rect>,
+    task_log_rows: Vec<Rect>,
+    task_log_indices: Vec<usize>,
     setting_rows: Vec<Rect>,
 }
 
@@ -63,6 +64,8 @@ impl Default for UiRegions {
             settings_tab: Rect::default(),
             start_button: None,
             task_cancel_button: None,
+            task_log_rows: Vec::new(),
+            task_log_indices: Vec::new(),
             setting_rows: Vec::new(),
         }
     }
@@ -91,31 +94,6 @@ enum Popup {
     DeleteService(ServiceListPopup),
 }
 
-#[derive(Debug, Clone, Serialize)]
-struct PlannerTaskSubmitRequest {
-    goal: String,
-    provider: String,
-    model: Option<String>,
-    max_steps: i32,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct PlannerTaskSubmitResponse {
-    task_id: String,
-    status: String,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct PlannerTaskStatusResponse {
-    status: String,
-    stage: String,
-    message: String,
-    progress: u8,
-    step_count: i32,
-    max_steps: i32,
-    error: Option<String>,
-}
-
 #[derive(Debug, Clone, Deserialize)]
 struct PlannerEvent {
     seq: i32,
@@ -126,23 +104,15 @@ struct PlannerEvent {
     timestamp: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-struct PlannerTaskEventsResponse {
-    events: Vec<PlannerEvent>,
+struct LocalPlannerRuntime {
+    child: Child,
+    log_rx: Receiver<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-struct PlannerTaskCancelResponse {
-    task_id: String,
-    cancelled: bool,
-    status: String,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct BridgeHealthResponse {
-    status: String,
-    service: String,
-    version: String,
+struct TaskRenderRegions {
+    cancel_button: Option<Rect>,
+    log_rows: Vec<Rect>,
+    log_indices: Vec<usize>,
 }
 
 struct App {
@@ -164,9 +134,10 @@ struct App {
     task_max_steps: i32,
     task_error: String,
     task_events: Vec<PlannerEvent>,
+    runtime: Option<LocalPlannerRuntime>,
     last_task_poll_at: Instant,
-    last_bridge_probe_at: Instant,
     bridge_logs: Vec<String>,
+    selected_log_index: Option<usize>,
 }
 
 impl App {
@@ -190,9 +161,10 @@ impl App {
             task_max_steps: 0,
             task_error: String::new(),
             task_events: Vec::new(),
+            runtime: None,
             last_task_poll_at: Instant::now(),
-            last_bridge_probe_at: Instant::now() - Duration::from_secs(10),
             bridge_logs: Vec::new(),
+            selected_log_index: None,
         }
     }
 
@@ -427,80 +399,79 @@ impl App {
             return;
         }
 
-        match submit_planner_task(requirement.clone(), 12) {
-            Ok(response) if response.status == "accepted" => {
-                self.current_task_id = Some(response.task_id.clone());
-                self.task_status = "pending".to_string();
-                self.task_stage = "queued".to_string();
-                self.task_message = "任务已提交，等待 bridge 执行".to_string();
+        if self.runtime.is_some() {
+            self.status = "已有运行中的任务，请先取消或等待结束".to_string();
+            return;
+        }
+
+        match start_local_planner_runtime(requirement.clone(), 12) {
+            Ok(runtime) => {
+                self.current_task_id = Some(format!("local_{}", chrono_like_now()));
+                self.task_status = "running".to_string();
+                self.task_stage = "planner_start".to_string();
+                self.task_message = "本地任务已启动".to_string();
                 self.task_progress = 0;
                 self.task_step_count = 0;
                 self.task_max_steps = 12;
                 self.task_error.clear();
                 self.task_events.clear();
                 self.last_task_poll_at = Instant::now() - Duration::from_secs(1);
+                self.runtime = Some(runtime);
+                self.bridge_logs.clear();
+                self.selected_log_index = None;
                 self.active_tab = Tab::Task;
-                self.status = format!("任务已提交，task_id={}", response.task_id);
+                self.status = "任务已提交：本地 conda planner 进程已启动".to_string();
             }
             Err(e) => {
-                self.status = format!("任务提交失败: {e}");
-            }
-            Ok(response) => {
-                self.status = format!("任务提交失败：后端状态={}", response.status);
+                self.status = format!("任务启动失败: {e}");
             }
         }
     }
 
     fn poll_task_updates(&mut self) {
-        let Some(task_id) = self.current_task_id.clone() else {
+        if self.runtime.is_none() {
             return;
-        };
+        }
         if self.last_task_poll_at.elapsed() < Duration::from_millis(500) {
             return;
         }
         self.last_task_poll_at = Instant::now();
-
-        match fetch_planner_task_status(&task_id) {
-            Ok(task) => {
-                self.task_status = task.status.clone();
-                self.task_stage = task.stage.clone();
-                self.task_message = task.message.clone();
-                self.task_progress = task.progress;
-                self.task_step_count = task.step_count;
-                self.task_max_steps = task.max_steps;
-                self.task_error = task.error.unwrap_or_default();
-                self.status = format!(
-                    "任务状态：{} | 阶段：{} | {}%",
-                    self.task_status, self.task_stage, self.task_progress
-                );
-                if let Ok(events) = fetch_planner_task_events(&task_id) {
-                    self.task_events = events.events;
-                }
-                if matches!(self.task_status.as_str(), "success" | "failed" | "cancelled" | "timeout")
-                {
-                    if !task.message.is_empty() {
-                        self.status = format!("任务结束：{}（{}）", self.task_status, task.message);
+        let mut pending_logs = Vec::new();
+        let mut should_cleanup = false;
+        if let Some(runtime) = self.runtime.as_mut() {
+            while let Ok(line) = runtime.log_rx.try_recv() {
+                pending_logs.push(line);
+            }
+            match runtime.child.try_wait() {
+                Ok(Some(exit)) => {
+                    if exit.success() {
+                        self.task_status = "success".to_string();
+                        self.task_stage = "finalize".to_string();
+                        self.task_progress = 100;
+                        self.status = "任务结束：success（本地进程退出）".to_string();
+                    } else {
+                        self.task_status = "failed".to_string();
+                        self.task_stage = "failed".to_string();
+                        self.task_error = format!("planner 进程退出码: {exit}");
+                        self.status = format!("任务结束：failed（{}）", self.task_error);
                     }
+                    should_cleanup = true;
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    self.task_status = "failed".to_string();
+                    self.task_stage = "failed".to_string();
+                    self.task_error = format!("读取子进程状态失败: {e}");
+                    self.status = format!("任务结束：failed（{}）", self.task_error);
+                    should_cleanup = true;
                 }
             }
-            Err(e) => {
-                self.status = format!("任务状态拉取失败: {e}");
-            }
         }
-    }
-
-    fn poll_bridge_snapshot(&mut self) {
-        if self.last_bridge_probe_at.elapsed() < Duration::from_secs(5) {
-            return;
+        for line in pending_logs {
+            self.apply_runtime_log(line);
         }
-        self.last_bridge_probe_at = Instant::now();
-        match fetch_bridge_health() {
-            Ok(health) => {
-                let _ = (&health.status, &health.service, &health.version);
-            }
-            Err(e) => {
-                self.status = format!("bridge 健康检查失败: {e}");
-            }
+        if should_cleanup {
+            self.runtime = None;
         }
     }
 
@@ -509,31 +480,85 @@ impl App {
         if self.bridge_logs.len() > 300 {
             let keep_from = self.bridge_logs.len() - 300;
             self.bridge_logs = self.bridge_logs.split_off(keep_from);
+            if let Some(idx) = self.selected_log_index {
+                self.selected_log_index = idx.checked_sub(keep_from);
+            }
+        }
+        if let Some(idx) = self.selected_log_index {
+            if idx >= self.bridge_logs.len() {
+                self.selected_log_index = None;
+            }
         }
     }
 
-    fn poll_runtime_logs(&mut self, log_rx: &Receiver<String>) {
-        while let Ok(line) = log_rx.try_recv() {
-            self.push_bridge_log(line);
+    fn apply_runtime_log(&mut self, line: String) {
+        if line.contains("RequestsDependencyWarning:")
+            || line.contains("requests\\__init__.py:113")
+            || line.trim() == "[stderr]   warnings.warn("
+        {
+            return;
         }
+        if let Some((step, max_steps)) = parse_step_progress(&line) {
+            self.task_step_count = step;
+            self.task_max_steps = max_steps;
+            if max_steps > 0 {
+                self.task_progress = ((step * 100) / max_steps).min(99) as u8;
+            }
+        }
+        if line.contains("[error|") {
+            self.task_stage = "error".to_string();
+            self.task_message = line.clone();
+        } else if let Some(stage) = parse_stage(&line) {
+            self.task_stage = stage;
+            self.task_message = line.clone();
+        }
+        self.push_bridge_log(line);
     }
 
     fn cancel_current_task(&mut self) {
-        let Some(task_id) = self.current_task_id.clone() else {
+        let Some(runtime) = self.runtime.as_mut() else {
             self.status = "暂无可取消任务".to_string();
             return;
         };
-        match cancel_planner_task(&task_id) {
-            Ok(resp) if resp.cancelled => {
-                self.task_status = resp.status.clone();
-                self.status = format!("已发送取消请求，task_id={}", resp.task_id);
+        let killed = runtime.child.kill();
+        self.runtime = None;
+        self.task_status = "cancelled".to_string();
+        self.task_stage = "cancelled".to_string();
+        self.task_message = "任务已取消".to_string();
+        match killed {
+            Ok(_) => self.status = "已取消本地 planner 任务".to_string(),
+            Err(e) => self.status = format!("取消任务失败: {e}"),
+        }
+    }
+
+    fn copy_log_by_index(&mut self, idx: usize) {
+        if let Some(line) = self.bridge_logs.get(idx) {
+            match copy_to_clipboard(line) {
+                Ok(_) => self.status = format!("已复制日志: {line}"),
+                Err(e) => self.status = format!("复制日志失败: {e}"),
             }
-            Ok(resp) => {
-                self.status = format!("取消失败，后端状态={}", resp.status);
-            }
-            Err(e) => {
-                self.status = format!("取消任务失败: {e}");
-            }
+        } else {
+            self.status = "未找到可复制的日志".to_string();
+        }
+    }
+
+    fn copy_selected_log(&mut self) {
+        if let Some(idx) = self.selected_log_index {
+            self.copy_log_by_index(idx);
+        } else {
+            self.status = "请先用鼠标选中一行日志".to_string();
+        }
+    }
+
+    fn copy_all_logs(&mut self) {
+        if self.bridge_logs.is_empty() {
+            self.status = "暂无日志可复制".to_string();
+            return;
+        }
+        let joined = self.bridge_logs.join("\n");
+        match copy_to_clipboard(&joined) {
+            Ok(_) => self.status = format!("已复制全部日志，共 {} 行", self.bridge_logs.len()),
+            Err(e) => self.status = format!("复制全部日志失败: {e}"),
         }
     }
 
@@ -565,6 +590,12 @@ impl App {
             KeyCode::Char(c) => {
                 if self.active_tab == Tab::Home && !c.is_control() {
                     self.home_intro_input.push(c);
+                } else if self.active_tab == Tab::Task {
+                    match c {
+                        'c' | 'C' => self.copy_selected_log(),
+                        'a' | 'A' => self.copy_all_logs(),
+                        _ => {}
+                    }
                 }
             }
             KeyCode::Enter => self.activate_current(),
@@ -599,6 +630,15 @@ impl App {
                 }
             }
             Tab::Task => {
+                for (idx, rect) in self.ui_regions.task_log_rows.iter().enumerate() {
+                    if in_rect(*rect, x, y) {
+                        if let Some(&log_idx) = self.ui_regions.task_log_indices.get(idx) {
+                            self.selected_log_index = Some(log_idx);
+                            self.copy_log_by_index(log_idx);
+                        }
+                        return;
+                    }
+                }
                 if let Some(btn) = self.ui_regions.task_cancel_button {
                     if in_rect(btn, x, y) {
                         self.cancel_current_task();
@@ -625,6 +665,12 @@ fn active_form_field_mut(form: &mut AddServicePopup) -> &mut String {
         2 => &mut form.api_url,
         _ => &mut form.api_key,
     }
+}
+
+fn copy_to_clipboard(text: &str) -> Result<()> {
+    let mut clipboard = Clipboard::new()?;
+    clipboard.set_text(text.to_string())?;
+    Ok(())
 }
 
 fn short_timeout_client() -> Result<Client> {
@@ -668,52 +714,93 @@ fn delete_service(id: i64) -> Result<bool> {
     Ok(body.deleted)
 }
 
-fn submit_planner_task(goal: String, max_steps: i32) -> Result<PlannerTaskSubmitResponse> {
-    let url = format!("{BRIDGE_API_BASE}/planner/tasks");
-    let client = short_timeout_client()?;
-    let input = PlannerTaskSubmitRequest {
-        goal,
-        provider: "siliconflow".to_string(),
-        model: None,
-        max_steps,
-    };
-    let resp = client.post(url).json(&input).send()?.error_for_status()?;
-    Ok(resp.json::<PlannerTaskSubmitResponse>()?)
+fn chrono_like_now() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
-fn fetch_planner_task_status(task_id: &str) -> Result<PlannerTaskStatusResponse> {
-    let url = format!("{BRIDGE_API_BASE}/planner/tasks/{task_id}");
-    let client = short_timeout_client()?;
-    let resp = client.get(url).send()?.error_for_status()?;
-    Ok(resp.json::<PlannerTaskStatusResponse>()?)
+fn parse_step_progress(line: &str) -> Option<(i32, i32)> {
+    let marker = "STEP ";
+    let idx = line.find(marker)?;
+    let rest = &line[idx + marker.len()..];
+    let slash = rest.find('/')?;
+    let lhs = rest[..slash].trim().parse::<i32>().ok()?;
+    let rhs_digits: String = rest[slash + 1..]
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    let rhs = rhs_digits.parse::<i32>().ok()?;
+    Some((lhs, rhs))
 }
 
-fn fetch_planner_task_events(task_id: &str) -> Result<PlannerTaskEventsResponse> {
-    let url = format!("{BRIDGE_API_BASE}/planner/tasks/{task_id}/events");
-    let client = short_timeout_client()?;
-    let resp = client.get(url).send()?.error_for_status()?;
-    Ok(resp.json::<PlannerTaskEventsResponse>()?)
+fn parse_stage(line: &str) -> Option<String> {
+    let start = line.find('|')?;
+    let end = line[start + 1..].find(']')?;
+    Some(line[start + 1..start + 1 + end].to_string())
 }
 
-fn cancel_planner_task(task_id: &str) -> Result<PlannerTaskCancelResponse> {
-    let url = format!("{BRIDGE_API_BASE}/planner/tasks/{task_id}/cancel");
-    let client = short_timeout_client()?;
-    let resp = client.post(url).send()?.error_for_status()?;
-    Ok(resp.json::<PlannerTaskCancelResponse>()?)
+fn planner_python_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("python")
+        .join("planner")
 }
 
-fn fetch_bridge_health() -> Result<BridgeHealthResponse> {
-    let url = format!("{BRIDGE_API_BASE}/health");
-    let client = short_timeout_client()?;
-    let resp = client.get(url).send()?.error_for_status()?;
-    Ok(resp.json::<BridgeHealthResponse>()?)
+fn pump_reader_lines<R: std::io::Read + Send + 'static>(
+    reader: R,
+    prefix: &'static str,
+    tx: mpsc::Sender<String>,
+) {
+    thread::spawn(move || {
+        let reader = BufReader::new(reader);
+        for line in reader.lines().map_while(Result::ok) {
+            let _ = tx.send(format!("[{prefix}] {line}"));
+        }
+    });
+}
+
+fn start_local_planner_runtime(goal: String, max_steps: i32) -> Result<LocalPlannerRuntime> {
+    let planner_dir = planner_python_dir();
+    let mut child = Command::new("conda")
+        .args([
+            "run",
+            "-n",
+            "omni",
+            "python",
+            "main.py",
+            "--goal-input",
+            &goal,
+            "--max-steps",
+            &max_steps.to_string(),
+            "--provider",
+            "siliconflow",
+        ])
+        .current_dir(planner_dir)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("无法读取 planner stdout"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("无法读取 planner stderr"))?;
+    let (tx, rx) = mpsc::channel::<String>();
+    pump_reader_lines(stdout, "stdout", tx.clone());
+    pump_reader_lines(stderr, "stderr", tx);
+    Ok(LocalPlannerRuntime { child, log_rx: rx })
 }
 
 fn main() -> Result<()> {
     start_api_server();
     wait_for_api_ready()?;
-    let mut bridge_child = ensure_bridge_server()?;
-    let bridge_log_rx = start_bridge_log_stream();
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -721,7 +808,7 @@ fn main() -> Result<()> {
 
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
-    let result = run_app(&mut terminal, bridge_log_rx.as_ref());
+    let result = run_app(&mut terminal);
 
     disable_raw_mode()?;
     execute!(
@@ -730,9 +817,6 @@ fn main() -> Result<()> {
         DisableMouseCapture
     )?;
     terminal.show_cursor()?;
-    if let Some(child) = bridge_child.as_mut() {
-        let _ = child.kill();
-    }
 
     result
 }
@@ -751,121 +835,6 @@ fn wait_for_api_ready() -> Result<()> {
     Err(anyhow::anyhow!("api server not ready"))
 }
 
-fn wait_for_bridge_ready() -> Result<()> {
-    let url = format!("{BRIDGE_API_BASE}/health");
-    let client = medium_timeout_client()?;
-    for _ in 0..60 {
-        if let Ok(resp) = client.get(&url).send() {
-            if resp.status().is_success() {
-                return Ok(());
-            }
-        }
-        thread::sleep(Duration::from_millis(100));
-    }
-    Err(anyhow::anyhow!("bridge server not ready"))
-}
-
-fn bridge_python_app_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("..")
-        .join("python")
-}
-
-fn ensure_bridge_server() -> Result<Option<Child>> {
-    let url = format!("{BRIDGE_API_BASE}/health");
-    let client = medium_timeout_client()?;
-    if let Ok(resp) = client.get(&url).send() {
-        if resp.status().is_success() {
-            return Ok(None);
-        }
-    }
-
-    let app_dir = bridge_python_app_dir();
-    let app_dir = app_dir.to_string_lossy().to_string();
-    let child = Command::new("conda")
-        .args([
-            "run",
-            "-n",
-            "omni",
-            // 注意这是测试环境使用的命令，正式环境请替换为合适的启动命令
-            "python",
-            "-m",
-            "uvicorn",
-            "bridge.main:app",
-            "--host",
-            "127.0.0.1",
-            "--port",
-            "55002",
-            "--app-dir",
-        ])
-        .arg(app_dir)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
-    wait_for_bridge_ready()?;
-    Ok(Some(child))
-}
-
-fn start_bridge_log_stream() -> Option<Receiver<String>> {
-    let (tx, rx) = mpsc::channel::<String>();
-    let builder = thread::Builder::new().name("bridge-log-ws".to_string());
-    if builder
-        .spawn(move || {
-            loop {
-                match connect(BRIDGE_WS_LOG_URL) {
-                    Ok((mut socket, _)) => {
-                        if tx.send("[ws] 已连接 bridge 实时日志".to_string()).is_err() {
-                            break;
-                        }
-                        loop {
-                            let next = socket.read();
-                            match next {
-                                Ok(Message::Text(text)) => {
-                                    if tx.send(text.to_string()).is_err() {
-                                        return;
-                                    }
-                                }
-                                Ok(Message::Binary(bytes)) => {
-                                    if let Ok(text) = String::from_utf8(bytes.to_vec()) {
-                                        if tx.send(text).is_err() {
-                                            return;
-                                        }
-                                    }
-                                }
-                                Ok(Message::Close(_)) => {
-                                    let _ = tx.send("[ws] bridge 日志连接已关闭，准备重连".to_string());
-                                    break;
-                                }
-                                Ok(_) => {}
-                                Err(err) => {
-                                    if tx.send(format!("[ws] bridge 日志流错误: {err}")).is_err() {
-                                        return;
-                                    }
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                    Err(err) => {
-                        if tx
-                            .send(format!("[ws] 连接 bridge 日志失败: {err}"))
-                            .is_err()
-                        {
-                            break;
-                        }
-                    }
-                }
-                thread::sleep(Duration::from_secs(1));
-            }
-        })
-        .is_err()
-    {
-        return None;
-    }
-    Some(rx)
-}
-
 fn start_api_server() {
     let db_path = default_db_path();
     let addr: SocketAddr = "127.0.0.1:54001"
@@ -879,18 +848,11 @@ fn start_api_server() {
         }
     });
 }
-fn run_app(
-    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    bridge_log_rx: Option<&Receiver<String>>,
-) -> Result<()> {
+fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
     let mut app = App::new();
 
     while app.running {
         app.poll_task_updates();
-        app.poll_bridge_snapshot();
-        if let Some(rx) = bridge_log_rx {
-            app.poll_runtime_logs(rx);
-        }
 
         terminal.draw(|f| {
             app.ui_regions = draw_ui(f, &app);
@@ -970,6 +932,8 @@ fn draw_ui(f: &mut Frame<'_>, app: &App) -> UiRegions {
         settings_tab,
         start_button: None,
         task_cancel_button: None,
+        task_log_rows: Vec::new(),
+        task_log_indices: Vec::new(),
         setting_rows: Vec::new(),
     };
 
@@ -986,7 +950,10 @@ fn draw_ui(f: &mut Frame<'_>, app: &App) -> UiRegions {
             );
         }
         Tab::Task => {
-            regions.task_cancel_button = render_task(f, chunks[1], app);
+            let task_regions = render_task(f, chunks[1], app);
+            regions.task_cancel_button = task_regions.cancel_button;
+            regions.task_log_rows = task_regions.log_rows;
+            regions.task_log_indices = task_regions.log_indices;
         }
         Tab::Settings => {
             regions.setting_rows = render_settings(f, chunks[1], app);
@@ -999,7 +966,7 @@ fn draw_ui(f: &mut Frame<'_>, app: &App) -> UiRegions {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(" 状态栏 (Q/Esc退出, 方向键导航, Enter执行) ")
+                .title(" 状态栏 (Q/Esc退出, 方向键导航, Enter执行, 任务页:C复制选中/A复制全部) ")
                 .border_style(Style::default().fg(COLOR_ACCENT)),
         );
     f.render_widget(footer, chunks[2]);
@@ -1178,7 +1145,7 @@ fn render_settings(f: &mut Frame<'_>, area: Rect, app: &App) -> Vec<Rect> {
     rows
 }
 
-fn render_task(f: &mut Frame<'_>, area: Rect, app: &App) -> Option<Rect> {
+fn render_task(f: &mut Frame<'_>, area: Rect, app: &App) -> TaskRenderRegions {
     let block = Block::default()
         .borders(Borders::ALL)
         .title(" 任务 ")
@@ -1186,7 +1153,7 @@ fn render_task(f: &mut Frame<'_>, area: Rect, app: &App) -> Option<Rect> {
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    let mut lines = vec![
+    let mut lines: Vec<Line<'_>> = vec![
         Line::from("任务中心"),
         Line::from(format!(
             "task_id: {}",
@@ -1212,9 +1179,24 @@ fn render_task(f: &mut Frame<'_>, area: Rect, app: &App) -> Option<Rect> {
             event.seq, event.event_type, event.stage, event.timestamp, event.message
         )));
     }
-    lines.push(Line::from("实时Python日志(WS):"));
-    for log in app.bridge_logs.iter().rev().take(6).rev() {
-        lines.push(Line::from(log.clone()));
+    lines.push(Line::from("实时Python日志(本地进程，鼠标点击可选中):"));
+    let visible_count = 6usize.min(app.bridge_logs.len());
+    let start_idx = app.bridge_logs.len().saturating_sub(visible_count);
+    let mut log_rows = Vec::with_capacity(visible_count);
+    let mut log_indices = Vec::with_capacity(visible_count);
+    let first_log_row = lines.len();
+    for idx in start_idx..app.bridge_logs.len() {
+        let selected = app.selected_log_index == Some(idx);
+        let style = if selected {
+            Style::default()
+                .fg(COLOR_BG)
+                .bg(COLOR_ACCENT)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(COLOR_TEXT).bg(COLOR_BG)
+        };
+        lines.push(Line::from(Span::styled(app.bridge_logs[idx].clone(), style)));
+        log_indices.push(idx);
     }
 
     let content = Paragraph::new(lines)
@@ -1227,18 +1209,32 @@ fn render_task(f: &mut Frame<'_>, area: Rect, app: &App) -> Option<Rect> {
         .split(inner);
     f.render_widget(content, sections[0]);
 
+    let row_width = sections[0].width;
+    for offset in 0..visible_count {
+        let row = first_log_row + offset;
+        if row as u16 >= sections[0].height {
+            break;
+        }
+        log_rows.push(Rect::new(
+            sections[0].x,
+            sections[0].y + row as u16,
+            row_width,
+            1,
+        ));
+    }
+
     let cancel_button = Rect::new(
         sections[1].x,
         sections[1].y,
         18.min(sections[1].width),
         sections[1].height.min(3),
     );
-    let cancel_text = if app.current_task_id.is_some() {
+    let cancel_text = if app.runtime.is_some() {
         "[ 取消任务 ]"
     } else {
         "[ 暂无任务 ]"
     };
-    let cancel_style = if app.current_task_id.is_some() {
+    let cancel_style = if app.runtime.is_some() {
         Style::default()
             .fg(COLOR_BG)
             .bg(COLOR_ACCENT)
@@ -1256,7 +1252,11 @@ fn render_task(f: &mut Frame<'_>, area: Rect, app: &App) -> Option<Rect> {
         );
     f.render_widget(cancel_btn, cancel_button);
 
-    Some(cancel_button)
+    TaskRenderRegions {
+        cancel_button: Some(cancel_button),
+        log_rows,
+        log_indices,
+    }
 }
 
 fn render_popup(f: &mut Frame<'_>, popup: &Popup, content_area: Rect) {
@@ -1442,14 +1442,3 @@ fn render_menu_button(f: &mut Frame<'_>, area: Rect, label: &str, selected: bool
 
     f.render_widget(button, area);
 }
-
-
-
-
-
-
-
-
-
-
-

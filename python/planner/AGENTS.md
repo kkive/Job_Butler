@@ -15,7 +15,7 @@
 - 工具函数（包括但不限于，截图、识别按钮、点击、滚动、键盘操作）
 - 状态图节点（think/plan/decide/execute_tool/finalize）
 - CLI 启动入口
-- `tool_detect_clickable_buttons` 依赖 `python/OmniParser-master` 实现
+- `tool_detect_clickable_buttons` 依赖 `python/OmniParser` 实现
 
 ## 状态结构（GraphState）
 主要字段：

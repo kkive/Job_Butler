@@ -5,7 +5,7 @@ Python 侧 AI 能力集合。
 
 ## 子模块
 - `planner`：langgraph 流程编排
-- `vision`：OmniParser-master 识别
+- `vision`：OmniParser 识别
 - `bridge`：与 Rust 通信
 
 ## 约束
@@ -14,7 +14,7 @@ Python 侧 AI 能力集合。
 
 ## 新增说明（planner）
 - `python/planner` 提供可运行 langgraph
-- 视觉解析通过 `python/OmniParser-master` 完成
+- 视觉解析通过 `python/OmniParser` 完成
 - 模型 key/url/model_name 通过 `crates/api` 的 HTTP API 读取数据库配置
 
 ## Rust 与 Python 通信方案（重要）

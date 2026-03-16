@@ -11,7 +11,7 @@ ratatui.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 tokio.workspace = true
-tungstenite = "0.24"
+arboard = "3.4"
 job-agent-api = { path = "../../crates/api" }
 job-agent-storage = { path = "../../crates/storage" }
 
